@@ -92,6 +92,10 @@ wss.on('connection', (ws) => {
       case 'video-change':
         handleVideoChange(data, userId);
         break;
+
+      case 'voice-ready':
+        handleVoiceReady(data, userId);
+        break;
     }
   }
 
@@ -361,6 +365,21 @@ wss.on('connection', (ws) => {
     }, fromUserId);
     
     console.log(`User ${fromUserId} mic status: ${muted ? 'muted' : 'unmuted'}`);
+  }
+
+  // Handle voice ready (user is ready for WebRTC connections)
+  function handleVoiceReady(data, fromUserId) {
+    const { roomId } = data;
+
+    if (!rooms.has(roomId)) return;
+
+    console.log(`User ${fromUserId} is ready for voice chat`);
+
+    // Broadcast to all other participants that this user is ready
+    broadcastToRoom(roomId, {
+      type: 'voice-ready',
+      userId: fromUserId
+    }, fromUserId);
   }
 
   // Handle video change (user navigated to different video)
