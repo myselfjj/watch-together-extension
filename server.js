@@ -88,12 +88,19 @@ wss.on('connection', (ws) => {
       case 'mic-status':
         handleMicStatus(data, userId);
         break;
+
+      case 'video-change':
+        handleVideoChange(data, userId);
+        break;
     }
   }
 
   // Join a room
   function joinRoom(roomId, userId, ws, username) {
-    if (!rooms.has(roomId)) {
+    // Check if room exists (to determine if this is first participant)
+    const isNewRoom = !rooms.has(roomId);
+
+    if (isNewRoom) {
       rooms.set(roomId, {
         participants: new Map(),
         state: {
@@ -106,6 +113,8 @@ wss.on('connection', (ws) => {
     }
 
     const room = rooms.get(roomId);
+    const isFirstParticipant = room.participants.size === 0;
+
     room.participants.set(userId, {
       ws,
       username,
@@ -135,12 +144,34 @@ wss.on('connection', (ws) => {
       username: username
     });
 
+    // If not the first participant, pause video for everyone to sync
+    if (!isFirstParticipant) {
+      // Update room state to paused
+      room.state.paused = true;
+
+      // Broadcast pause-on-join to ALL participants (including new one)
+      const pauseMessage = JSON.stringify({
+        type: 'user-joined-pause',
+        username: username,
+        time: room.state.time,
+        rate: room.state.rate
+      });
+
+      room.participants.forEach((participant) => {
+        if (participant.ws.readyState === WebSocket.OPEN) {
+          participant.ws.send(pauseMessage);
+        }
+      });
+
+      console.log(`Video paused for sync - ${username} joined room ${roomId}`);
+    }
+
     // Send participant count and list
     const participantList = Array.from(room.participants.entries()).map(([id, p]) => ({
       userId: id,
       username: p.username
     }));
-    
+
     broadcastToRoom(roomId, {
       type: 'participants',
       count: room.participants.size,
@@ -330,6 +361,23 @@ wss.on('connection', (ws) => {
     }, fromUserId);
     
     console.log(`User ${fromUserId} mic status: ${muted ? 'muted' : 'unmuted'}`);
+  }
+
+  // Handle video change (user navigated to different video)
+  function handleVideoChange(data, fromUserId) {
+    const { roomId, url, username } = data;
+
+    if (!rooms.has(roomId)) return;
+
+    console.log(`User ${username} changed video to: ${url}`);
+
+    // Broadcast video change to all other participants
+    broadcastToRoom(roomId, {
+      type: 'video-change',
+      url: url,
+      username: username,
+      userId: fromUserId
+    }, fromUserId);
   }
 
   // Broadcast message to all participants in a room
