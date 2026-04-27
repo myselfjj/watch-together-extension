@@ -54,7 +54,7 @@ wss.on('connection', (ws) => {
       case 'join':
         currentRoom = data.roomId;
         currentUsername = data.username;
-        joinRoom(data.roomId, userId, ws, data.username);
+        joinRoom(data.roomId, userId, ws, data.username, data.create);
         break;
 
       case 'sync':
@@ -89,22 +89,20 @@ wss.on('connection', (ws) => {
         handleMicStatus(data, userId);
         break;
 
-      case 'video-change':
-        handleVideoChange(data, userId);
-        break;
-
-      case 'voice-ready':
-        handleVoiceReady(data, userId);
+      case 'video-on':
+      case 'video-off':
+        handleVideoStatus(data, userId);
         break;
     }
   }
 
   // Join a room
-  function joinRoom(roomId, userId, ws, username) {
-    // Check if room exists (to determine if this is first participant)
-    const isNewRoom = !rooms.has(roomId);
-
-    if (isNewRoom) {
+  function joinRoom(roomId, userId, ws, username, create = false) {
+    if (!rooms.has(roomId)) {
+      if (!create) {
+        ws.send(JSON.stringify({ type: 'error', code: 'ROOM_NOT_FOUND', message: 'Room not found. Check the room ID and try again.' }));
+        return;
+      }
       rooms.set(roomId, {
         participants: new Map(),
         state: {
@@ -117,8 +115,6 @@ wss.on('connection', (ws) => {
     }
 
     const room = rooms.get(roomId);
-    const isFirstParticipant = room.participants.size === 0;
-
     room.participants.set(userId, {
       ws,
       username,
@@ -148,34 +144,12 @@ wss.on('connection', (ws) => {
       username: username
     });
 
-    // If not the first participant, pause video for everyone to sync
-    if (!isFirstParticipant) {
-      // Update room state to paused
-      room.state.paused = true;
-
-      // Broadcast pause-on-join to ALL participants (including new one)
-      const pauseMessage = JSON.stringify({
-        type: 'user-joined-pause',
-        username: username,
-        time: room.state.time,
-        rate: room.state.rate
-      });
-
-      room.participants.forEach((participant) => {
-        if (participant.ws.readyState === WebSocket.OPEN) {
-          participant.ws.send(pauseMessage);
-        }
-      });
-
-      console.log(`Video paused for sync - ${username} joined room ${roomId}`);
-    }
-
     // Send participant count and list
     const participantList = Array.from(room.participants.entries()).map(([id, p]) => ({
       userId: id,
       username: p.username
     }));
-
+    
     broadcastToRoom(roomId, {
       type: 'participants',
       count: room.participants.size,
@@ -367,36 +341,11 @@ wss.on('connection', (ws) => {
     console.log(`User ${fromUserId} mic status: ${muted ? 'muted' : 'unmuted'}`);
   }
 
-  // Handle voice ready (user is ready for WebRTC connections)
-  function handleVoiceReady(data, fromUserId) {
-    const { roomId } = data;
-
+  function handleVideoStatus(data, fromUserId) {
+    const { roomId, type } = data;
     if (!rooms.has(roomId)) return;
-
-    console.log(`User ${fromUserId} is ready for voice chat`);
-
-    // Broadcast to all other participants that this user is ready
-    broadcastToRoom(roomId, {
-      type: 'voice-ready',
-      userId: fromUserId
-    }, fromUserId);
-  }
-
-  // Handle video change (user navigated to different video)
-  function handleVideoChange(data, fromUserId) {
-    const { roomId, url, username } = data;
-
-    if (!rooms.has(roomId)) return;
-
-    console.log(`User ${username} changed video to: ${url}`);
-
-    // Broadcast video change to all other participants
-    broadcastToRoom(roomId, {
-      type: 'video-change',
-      url: url,
-      username: username,
-      userId: fromUserId
-    }, fromUserId);
+    broadcastToRoom(roomId, { type, userId: fromUserId }, fromUserId);
+    console.log(`User ${fromUserId} video status: ${type}`);
   }
 
   // Broadcast message to all participants in a room
