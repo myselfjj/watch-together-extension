@@ -115,6 +115,17 @@ wss.on('connection', (ws) => {
     }
 
     const room = rooms.get(roomId);
+
+    // Evict any stale participant with the same username (reconnect scenario)
+    for (const [existingId, participant] of room.participants) {
+      if (participant.username === username && existingId !== userId) {
+        console.log(`Evicting stale session for ${username} (${existingId})`);
+        try { participant.ws.close(); } catch {}
+        room.participants.delete(existingId);
+        break;
+      }
+    }
+
     room.participants.set(userId, {
       ws,
       username,
@@ -405,8 +416,7 @@ function generateUserId() {
 
 // Start server
 const PORT = process.env.PORT || 3000;
-const HOST = '0.0.0.0'; // Listen on all interfaces for cloud deployment
+const HOST = '0.0.0.0';
 server.listen(PORT, HOST, () => {
   console.log(`WatchTogether server listening on ${HOST}:${PORT}`);
-  console.log(`WebSocket URL: ws://localhost:${PORT}`);
 });
