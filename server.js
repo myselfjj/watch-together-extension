@@ -1,5 +1,5 @@
 // WebSocket server for WatchTogether extension
-// This server handles real-time synchronization between clients
+// Real-time sync relay between clients (playback sync + WebRTC signalling).
 
 const WebSocket = require('ws');
 const express = require('express');
@@ -9,394 +9,418 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// Store active rooms and their participants
+// roomId -> {
+//   participants: Map<userId, { ws, username, sessionId, lastHeartbeat }>,
+//   recentSessions: Map<sessionId, lastSeenTs>,  // survives leave → reconnect grace
+//   state: { time, paused, rate, lastUpdate }
+// }
 const rooms = new Map();
 
-// Room data structure:
-// {
-//   roomId: {
-//     participants: Map of userId -> { ws, username, lastHeartbeat }
-//     state: { time, paused, rate, lastUpdate }
-//   }
-// }
+// `${roomId}:${sessionId}` -> timeout. A socket close defers the actual leave a few
+// seconds so a quick same-tab reconnect (network blip) doesn't flap "left"/"joined".
+const pendingLeaves = new Map();
+const LEAVE_GRACE_MS = 6000;
+const RECONNECT_GRACE_MS = 90000;
 
-// WebSocket connection handler
+// ─── Module-scope helpers ───────────────────────────────────────────────────
+// At module scope so the timers below can call them (closures can't be reached).
+
+function generateUserId() {
+  return Math.random().toString(36).substring(2, 15);
+}
+
+function participantList(room) {
+  return Array.from(room.participants.entries()).map(([id, p]) => ({
+    userId: id,
+    username: p.username
+  }));
+}
+
+function broadcastToRoom(roomId, message, excludeUserId = null) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  const messageStr = JSON.stringify(message);
+  room.participants.forEach((participant, id) => {
+    if (id !== excludeUserId && participant.ws.readyState === WebSocket.OPEN) {
+      try { participant.ws.send(messageStr); } catch {}
+    }
+  });
+}
+
+function broadcastParticipants(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  broadcastToRoom(roomId, {
+    type: 'participants',
+    count: room.participants.size,
+    list: participantList(room)
+  });
+}
+
+// Authoritative playback position, extrapolated from the last explicit action.
+// room.state is ONLY written by explicit sync actions + join, never by heartbeats,
+// so a passive/stale client can never drag the shared position backwards.
+function currentRoomTime(room) {
+  if (room.state.paused) return room.state.time;
+  const elapsed = ((Date.now() - room.state.lastUpdate) / 1000) * (room.state.rate || 1);
+  return room.state.time + elapsed;
+}
+
+// Idempotent: deletes the participant, notifies remaining peers, GCs empty rooms.
+function leaveRoom(roomId, userId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  const participant = room.participants.get(userId);
+  if (!participant) return; // already removed — safe to call twice
+
+  const username = participant.username;
+  // Remember the session briefly so a reconnect just after removal is still
+  // recognised as a reconnect (no spurious whole-room auto-pause).
+  if (participant.sessionId) room.recentSessions.set(participant.sessionId, Date.now());
+  room.participants.delete(userId);
+  console.log(`${username} left room ${roomId}`);
+
+  if (room.participants.size > 0) {
+    broadcastToRoom(roomId, { type: 'left', username, userId });
+    broadcastParticipants(roomId);
+  } else {
+    rooms.delete(roomId);
+    console.log(`Room ${roomId} deleted (empty)`);
+  }
+}
+
+function scheduleDeferredLeave(roomId, userId, sessionId) {
+  if (!sessionId) { leaveRoom(roomId, userId); return; }
+  const key = `${roomId}:${sessionId}`;
+  if (pendingLeaves.has(key)) clearTimeout(pendingLeaves.get(key));
+  const t = setTimeout(() => {
+    pendingLeaves.delete(key);
+    leaveRoom(roomId, userId);
+  }, LEAVE_GRACE_MS);
+  pendingLeaves.set(key, t);
+}
+
+function cancelDeferredLeave(roomId, sessionId) {
+  if (!sessionId) return;
+  const key = `${roomId}:${sessionId}`;
+  if (pendingLeaves.has(key)) { clearTimeout(pendingLeaves.get(key)); pendingLeaves.delete(key); }
+}
+
+// ─── Per-connection handling ────────────────────────────────────────────────
+
 wss.on('connection', (ws) => {
-  let userId = generateUserId();
+  const userId = generateUserId();
   let currentRoom = null;
   let currentUsername = null;
+  let currentSessionId = null;
+
+  // Liveness: server-initiated WS ping (handled by the browser's network stack,
+  // so it is NOT throttled when the user's tab is backgrounded — unlike setInterval).
+  ws.isAlive = true;
+  ws.on('pong', () => {
+    ws.isAlive = true;
+    if (currentRoom) {
+      const room = rooms.get(currentRoom);
+      const p = room && room.participants.get(userId);
+      if (p) {
+        p.lastHeartbeat = Date.now();
+        if (currentSessionId) room.recentSessions.set(currentSessionId, Date.now());
+      }
+    }
+  });
 
   console.log(`New connection: ${userId}`);
 
   ws.on('message', (message) => {
     try {
-      const data = JSON.parse(message);
-      handleMessage(ws, userId, data);
+      handleMessage(JSON.parse(message));
     } catch (error) {
-      console.error('Error parsing message:', error);
+      console.error('Error parsing message:', error.message);
     }
   });
 
   ws.on('close', () => {
     console.log(`Connection closed: ${userId}`);
-    if (currentRoom) {
-      leaveRoom(currentRoom, userId);
-    }
+    if (!currentRoom) return;
+    // Defer so a fast same-tab reconnect doesn't produce a left/joined flap.
+    // (An explicit 'leave' message takes the immediate path instead — see below.)
+    scheduleDeferredLeave(currentRoom, userId, currentSessionId);
   });
 
   ws.on('error', (error) => {
-    console.error('WebSocket error:', error);
+    console.error('WebSocket error:', error.message);
   });
 
-  // Handle incoming messages
-  function handleMessage(ws, userId, data) {
+  function handleMessage(data) {
     switch (data.type) {
       case 'join':
         currentRoom = data.roomId;
         currentUsername = data.username;
-        joinRoom(data.roomId, userId, ws, data.username, data.create);
+        currentSessionId = data.sessionId || null;
+        joinRoom(data.roomId, data.username, data.create, data.sessionId);
         break;
-
-      case 'sync':
-        handleSync(data);
+      case 'leave':
+        // Intentional leave → remove now (no grace) so peers see "left" instantly.
+        cancelDeferredLeave(data.roomId, currentSessionId);
+        leaveRoom(data.roomId, userId);
+        currentRoom = null;
         break;
-
-      case 'chat':
-        handleChat(data);
-        break;
-
-      case 'heartbeat':
-        handleHeartbeat(data);
-        break;
-      
-      case 'get_participants':
-        handleGetParticipants(data, ws);
-        break;
-      
-      case 'webrtc-offer':
-        handleWebRTCOffer(data, userId);
-        break;
-      
-      case 'webrtc-answer':
-        handleWebRTCAnswer(data, userId);
-        break;
-      
-      case 'webrtc-ice-candidate':
-        handleWebRTCIceCandidate(data, userId);
-        break;
-      
-      case 'mic-status':
-        handleMicStatus(data, userId);
-        break;
-
+      case 'sync': handleSync(data); break;
+      case 'reaction': handleReaction(data); break;
+      case 'request-sync': handleRequestSync(data); break;
+      case 'chat': handleChat(data); break;
+      case 'heartbeat': handleHeartbeat(data); break;
+      case 'get_participants': handleGetParticipants(data); break;
+      case 'webrtc-offer': relayWebRTC(data, 'webrtc-offer', { offer: data.offer }); break;
+      case 'webrtc-answer': relayWebRTC(data, 'webrtc-answer', { answer: data.answer }); break;
+      case 'webrtc-ice-candidate': relayWebRTC(data, 'webrtc-ice-candidate', { candidate: data.candidate }); break;
+      case 'mic-status': handleMicStatus(data); break;
       case 'video-on':
-      case 'video-off':
-        handleVideoStatus(data, userId);
-        break;
+      case 'video-off': handleVideoStatus(data); break;
     }
   }
 
-  // Join a room
-  function joinRoom(roomId, userId, ws, username, create = false) {
+  function joinRoom(roomId, username, create = false, sessionId = null) {
     if (!rooms.has(roomId)) {
       if (!create) {
-        ws.send(JSON.stringify({ type: 'error', code: 'ROOM_NOT_FOUND', message: 'Room not found. Check the room ID and try again.' }));
+        ws.send(JSON.stringify({
+          type: 'error',
+          code: 'ROOM_NOT_FOUND',
+          message: 'Room not found. Check the room ID and try again.'
+        }));
         return;
       }
       rooms.set(roomId, {
         participants: new Map(),
-        state: {
-          time: 0,
-          paused: true,
-          rate: 1,
-          lastUpdate: Date.now()
-        }
+        recentSessions: new Map(),
+        state: { time: 0, paused: true, rate: 1, lastUpdate: Date.now() }
       });
     }
 
     const room = rooms.get(roomId);
+    if (!room.recentSessions) room.recentSessions = new Map();
 
-    // Evict any stale participant with the same username (reconnect scenario)
-    for (const [existingId, participant] of room.participants) {
-      if (participant.username === username && existingId !== userId) {
-        console.log(`Evicting stale session for ${username} (${existingId})`);
-        try { participant.ws.close(); } catch {}
-        room.participants.delete(existingId);
-        break;
-      }
+    // This tab reconnected before its deferred-leave fired → cancel it.
+    cancelDeferredLeave(roomId, sessionId);
+
+    // Reconnect detection. A join is a reconnect if a live participant matches this
+    // tab (sessionId) OR this sessionId was seen in the room very recently. The
+    // recent-session check is essential: it stops a brief network drop (where the
+    // old socket was already removed) from being misread as a brand-new joiner and
+    // pausing the whole room.
+    let isReconnect = false;
+    const seenTs = sessionId ? room.recentSessions.get(sessionId) : null;
+    if (seenTs && (Date.now() - seenTs) <= RECONNECT_GRACE_MS) isReconnect = true;
+
+    // Evict any stale live socket for the same tab (or same username for legacy
+    // clients with no sessionId). Tag the broadcast reason:'reconnect' so peers
+    // clean up the ghost WITHOUT showing a misleading "left the room" message.
+    const stale = [];
+    for (const [existingId, p] of room.participants) {
+      if (existingId === userId) continue;
+      const sameTab = sessionId && p.sessionId === sessionId;
+      const sameNameLegacy = !sessionId && p.username === username;
+      if (sameTab || sameNameLegacy) { stale.push(existingId); isReconnect = true; }
+    }
+    for (const existingId of stale) {
+      const p = room.participants.get(existingId);
+      if (!p) continue;
+      console.log(`Evicting stale session for ${username} (${existingId})`);
+      try { p.ws.close(4000, 'evicted'); } catch {}
+      room.participants.delete(existingId);
+      broadcastToRoom(roomId, { type: 'left', username, userId: existingId, reason: 'reconnect' });
     }
 
-    room.participants.set(userId, {
-      ws,
-      username,
-      lastHeartbeat: Date.now()
-    });
-
+    room.participants.set(userId, { ws, username, sessionId, lastHeartbeat: Date.now() });
+    if (sessionId) room.recentSessions.set(sessionId, Date.now());
     console.log(`${username} joined room ${roomId}`);
 
-    // Send user their own ID and current state
-    ws.send(JSON.stringify({
-      type: 'joined-room',
-      userId: userId,
-      roomId: roomId
-    }));
+    ws.send(JSON.stringify({ type: 'joined-room', userId, roomId }));
 
-    // Send current state to the new participant
-    ws.send(JSON.stringify({
-      type: 'sync',
-      action: room.state.paused ? 'pause' : 'play',
-      time: room.state.time,
-      rate: room.state.rate
-    }));
-
-    // Notify all participants
-    broadcastToRoom(roomId, {
-      type: 'joined',
-      username: username
-    });
-
-    // Send participant count and list
-    const participantList = Array.from(room.participants.entries()).map(([id, p]) => ({
-      userId: id,
-      username: p.username
-    }));
-    
-    broadcastToRoom(roomId, {
-      type: 'participants',
-      count: room.participants.size,
-      list: participantList
-    });
-  }
-
-  // Leave a room
-  function leaveRoom(roomId, userId) {
-    if (!rooms.has(roomId)) return;
-
-    const room = rooms.get(roomId);
-    const participant = room.participants.get(userId);
-
-    if (participant) {
-      const username = participant.username;
-      room.participants.delete(userId);
-
-      console.log(`${username} left room ${roomId}`);
-
-      // Notify remaining participants
-      if (room.participants.size > 0) {
-        broadcastToRoom(roomId, {
-          type: 'left',
-          username: username,
-          userId: userId
-        });
-
-        const participantList = Array.from(room.participants.entries()).map(([id, p]) => ({
-          userId: id,
-          username: p.username
-        }));
-
-        broadcastToRoom(roomId, {
-          type: 'participants',
-          count: room.participants.size,
-          list: participantList
-        });
-      } else {
-        // Delete room if empty
-        rooms.delete(roomId);
-        console.log(`Room ${roomId} deleted (empty)`);
-      }
+    if (!isReconnect) {
+      // Genuinely NEW participant → pause EVERYONE at the current position so the
+      // joiner can catch up. Humans resume playback when ready.
+      const pauseTime = currentRoomTime(room);
+      room.state = { time: pauseTime, paused: true, rate: room.state.rate, lastUpdate: Date.now() };
+      broadcastToRoom(roomId, { type: 'sync', action: 'pause', time: pauseTime, rate: room.state.rate });
+      broadcastToRoom(roomId, { type: 'joined', username }, userId);
     }
+
+    // Always resync THIS socket to the authoritative position — and once more
+    // shortly after, in case the joiner's <video> element wasn't ready yet (e.g.
+    // Videasy creates it only on first play).
+    const resyncJoiner = () => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      const r = rooms.get(roomId);
+      if (!r || !r.participants.has(userId)) return;
+      ws.send(JSON.stringify({
+        type: 'sync',
+        action: r.state.paused ? 'pause' : 'play',
+        time: currentRoomTime(r),
+        rate: r.state.rate
+      }));
+    };
+    resyncJoiner();
+    setTimeout(resyncJoiner, 1500);
+
+    broadcastParticipants(roomId);
   }
 
-  // Handle sync events
   function handleSync(data) {
     const { roomId, action, time, rate, paused } = data;
-
-    if (!rooms.has(roomId)) return;
-
     const room = rooms.get(roomId);
+    if (!room) return;
 
-    // Update room state
+    // Explicit user action → authoritative. Explicit-undefined checks so a seek to
+    // 0:00 (time === 0) is recorded, not dropped by `||`.
     room.state = {
-      time: time || room.state.time,
-      paused: paused !== undefined ? paused : room.state.paused,
-      rate: rate || room.state.rate,
+      time: (time !== undefined && time !== null) ? time : room.state.time,
+      paused: (paused !== undefined) ? paused : room.state.paused,
+      rate: (rate !== undefined && rate !== null) ? rate : room.state.rate,
       lastUpdate: Date.now()
     };
 
-    // Broadcast sync to all participants except sender
-    broadcastToRoom(roomId, {
-      type: 'sync',
-      action: action,
-      time: time,
-      rate: rate,
-      paused: paused
-    }, userId);
+    // Broadcast to everyone EXCEPT the sender (the sender already performed the
+    // action locally). `username` is carried through so receivers can show an
+    // attribution toast ("Jayesh paused"). Incoming syncs always apply on the
+    // receiver regardless of its isSyncing window.
+    broadcastToRoom(roomId, { type: 'sync', action, time, rate, paused, username: data.username }, userId);
   }
 
-  // Handle chat messages
-  function handleChat(data) {
-    const { roomId, username, message } = data;
-
-    if (!rooms.has(roomId)) return;
-
-    // Broadcast chat to all participants
-    broadcastToRoom(roomId, {
-      type: 'chat',
-      username: username,
-      message: message
-    });
+  // Relay an emoji reaction to the other participants (sender renders its own).
+  function handleReaction(data) {
+    if (!rooms.has(data.roomId)) return;
+    broadcastToRoom(data.roomId, { type: 'reaction', emoji: data.emoji, username: data.username }, userId);
   }
 
-  // Handle heartbeat
-  function handleHeartbeat(data) {
-    const { roomId, time, paused, rate } = data;
-
-    if (!rooms.has(roomId)) return;
-
-    const room = rooms.get(roomId);
-    const participant = room.participants.get(userId);
-
-    if (participant) {
-      participant.lastHeartbeat = Date.now();
-
-      // Update room state with latest info
-      room.state.time = time;
-      room.state.paused = paused;
-      room.state.rate = rate;
-      room.state.lastUpdate = Date.now();
-    }
-  }
-
-  // Handle get participants request
-  function handleGetParticipants(data, ws) {
-    const { roomId } = data;
-
-    if (!rooms.has(roomId)) return;
-
-    const room = rooms.get(roomId);
-    
-    // Send participant count to requesting user
+  // A client asks for the current authoritative position (on Sync Now, or once its
+  // <video> finally appears). Reply to that one socket.
+  function handleRequestSync(data) {
+    const room = rooms.get(data.roomId);
+    if (!room || !room.participants.has(userId)) return;
     ws.send(JSON.stringify({
-      type: 'participants',
-      count: room.participants.size
+      type: 'sync',
+      action: room.state.paused ? 'pause' : 'play',
+      time: currentRoomTime(room),
+      rate: room.state.rate
     }));
   }
 
-  // Handle WebRTC offer
-  function handleWebRTCOffer(data, fromUserId) {
-    const { roomId, targetUserId, offer } = data;
-    
+  function handleChat(data) {
+    const { roomId, username, message } = data;
     if (!rooms.has(roomId)) return;
-    
-    const room = rooms.get(roomId);
-    const targetParticipant = room.participants.get(targetUserId);
-    
-    if (targetParticipant && targetParticipant.ws.readyState === WebSocket.OPEN) {
-      targetParticipant.ws.send(JSON.stringify({
-        type: 'webrtc-offer',
-        fromUserId: fromUserId,
-        offer: offer
-      }));
+    broadcastToRoom(roomId, { type: 'chat', username, message });
+  }
+
+  // Liveness only — intentionally does NOT touch room.state (see currentRoomTime).
+  function handleHeartbeat(data) {
+    const room = rooms.get(data.roomId);
+    const p = room && room.participants.get(userId);
+    if (p) {
+      p.lastHeartbeat = Date.now();
+      if (currentSessionId) room.recentSessions.set(currentSessionId, Date.now());
+    }
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'pong' }));
+  }
+
+  function handleGetParticipants(data) {
+    const room = rooms.get(data.roomId);
+    if (!room) return;
+    // MUST include the list — the client treats every 'participants' message as
+    // authoritative, so a count-only payload would blank everyone's UI.
+    ws.send(JSON.stringify({
+      type: 'participants',
+      count: room.participants.size,
+      list: participantList(room)
+    }));
+  }
+
+  function relayWebRTC(data, type, payload) {
+    const room = rooms.get(data.roomId);
+    if (!room) return;
+    const target = room.participants.get(data.targetUserId);
+    if (target && target.ws.readyState === WebSocket.OPEN) {
+      target.ws.send(JSON.stringify({ type, fromUserId: userId, ...payload }));
     }
   }
 
-  // Handle WebRTC answer
-  function handleWebRTCAnswer(data, fromUserId) {
-    const { roomId, targetUserId, answer } = data;
-    
-    if (!rooms.has(roomId)) return;
-    
-    const room = rooms.get(roomId);
-    const targetParticipant = room.participants.get(targetUserId);
-    
-    if (targetParticipant && targetParticipant.ws.readyState === WebSocket.OPEN) {
-      targetParticipant.ws.send(JSON.stringify({
-        type: 'webrtc-answer',
-        fromUserId: fromUserId,
-        answer: answer
-      }));
-    }
+  function handleMicStatus(data) {
+    if (!rooms.has(data.roomId)) return;
+    broadcastToRoom(data.roomId, { type: 'mic-status-update', userId, muted: data.muted }, userId);
   }
 
-  // Handle WebRTC ICE candidate
-  function handleWebRTCIceCandidate(data, fromUserId) {
-    const { roomId, targetUserId, candidate } = data;
-    
-    if (!rooms.has(roomId)) return;
-    
-    const room = rooms.get(roomId);
-    const targetParticipant = room.participants.get(targetUserId);
-    
-    if (targetParticipant && targetParticipant.ws.readyState === WebSocket.OPEN) {
-      targetParticipant.ws.send(JSON.stringify({
-        type: 'webrtc-ice-candidate',
-        fromUserId: fromUserId,
-        candidate: candidate
-      }));
-    }
-  }
-
-  // Handle microphone status update
-  function handleMicStatus(data, fromUserId) {
-    const { roomId, muted } = data;
-    
-    if (!rooms.has(roomId)) return;
-    
-    // Broadcast mic status to all other participants
-    broadcastToRoom(roomId, {
-      type: 'mic-status-update',
-      userId: fromUserId,
-      muted: muted
-    }, fromUserId);
-    
-    console.log(`User ${fromUserId} mic status: ${muted ? 'muted' : 'unmuted'}`);
-  }
-
-  function handleVideoStatus(data, fromUserId) {
-    const { roomId, type } = data;
-    if (!rooms.has(roomId)) return;
-    broadcastToRoom(roomId, { type, userId: fromUserId }, fromUserId);
-    console.log(`User ${fromUserId} video status: ${type}`);
-  }
-
-  // Broadcast message to all participants in a room
-  function broadcastToRoom(roomId, message, excludeUserId = null) {
-    if (!rooms.has(roomId)) return;
-
-    const room = rooms.get(roomId);
-    const messageStr = JSON.stringify(message);
-
-    room.participants.forEach((participant, id) => {
-      if (id !== excludeUserId && participant.ws.readyState === WebSocket.OPEN) {
-        participant.ws.send(messageStr);
-      }
-    });
+  function handleVideoStatus(data) {
+    if (!rooms.has(data.roomId)) return;
+    broadcastToRoom(data.roomId, { type: data.type, userId }, userId);
   }
 });
 
-// Clean up inactive participants
-setInterval(() => {
+// ─── Timers ─────────────────────────────────────────────────────────────────
+
+// Server-initiated WS ping → dead sockets get terminated (which fires 'close' →
+// deferred leave → leaveRoom → peers notified). Survives background-tab throttling.
+const pingInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      try { ws.terminate(); } catch {}
+      return;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  });
+}, 25000);
+
+// Secondary safety net: reap participants whose heartbeat/pong stopped. Routes
+// through leaveRoom so peers are always notified (the old code deleted silently).
+const reapInterval = setInterval(() => {
   const now = Date.now();
-  const TIMEOUT = 30000; // 30 seconds
-
+  const TIMEOUT = 60000; // generous; WS ping keeps healthy backgrounded tabs alive
+  const victims = [];
   rooms.forEach((room, roomId) => {
-    room.participants.forEach((participant, userId) => {
-      if (now - participant.lastHeartbeat > TIMEOUT) {
-        console.log(`Removing inactive participant: ${participant.username}`);
-        participant.ws.close();
-        room.participants.delete(userId);
-      }
+    room.participants.forEach((p, uid) => {
+      if (now - p.lastHeartbeat > TIMEOUT) victims.push({ roomId, userId: uid });
     });
-
-    // Delete empty rooms
-    if (room.participants.size === 0) {
-      rooms.delete(roomId);
-      console.log(`Room ${roomId} deleted (inactive)`);
+    // Prune old recent-session entries so the map can't grow unbounded.
+    if (room.recentSessions) {
+      room.recentSessions.forEach((ts, sid) => {
+        if (now - ts > RECONNECT_GRACE_MS) room.recentSessions.delete(sid);
+      });
     }
   });
-}, 10000); // Check every 10 seconds
+  for (const { roomId, userId } of victims) {
+    const room = rooms.get(roomId);
+    if (!room) continue;
+    const p = room.participants.get(userId);
+    if (!p) continue;
+    console.log(`Removing inactive participant: ${p.username}`);
+    try { p.ws.terminate(); } catch {}
+    leaveRoom(roomId, userId);
+  }
+}, 15000);
 
-// Express routes
+// Periodic drift correction: nudge every client to the authoritative position so
+// small playback drift ("one user is ahead") self-corrects. Only while playing.
+const driftInterval = setInterval(() => {
+  rooms.forEach((room, roomId) => {
+    if (room.participants.size < 2 || room.state.paused) return;
+    broadcastToRoom(roomId, {
+      type: 'sync',
+      action: 'drift',
+      time: currentRoomTime(room),
+      rate: room.state.rate,
+      paused: false
+    });
+  });
+}, 5000);
+
+wss.on('close', () => {
+  clearInterval(pingInterval);
+  clearInterval(reapInterval);
+  clearInterval(driftInterval);
+});
+
+// ─── Express routes ─────────────────────────────────────────────────────────
+
 app.get('/', (req, res) => {
   res.send('WatchTogether Sync Server is running!');
 });
@@ -409,12 +433,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Helper function to generate user ID
-function generateUserId() {
-  return Math.random().toString(36).substring(2, 15);
-}
-
-// Start server
 const PORT = process.env.PORT || 3000;
 const HOST = '0.0.0.0';
 server.listen(PORT, HOST, () => {
